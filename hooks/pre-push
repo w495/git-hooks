@@ -1,0 +1,156 @@
+#!/bin/sh
+
+# Цветастый текст
+NORMAL='\033[0m'
+BLACK='\033[0;30m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+GRAY='\033[0;37m'
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # Текущая директория
+LOG_FILE="$DIR/../../pre-push.log"
+PROTECTED_BRANCH='master' # Релизная ветка
+CURRENT_BRANCH=$(git symbolic-ref HEAD | sed -e 's,.*/\(.*\),\1,') # Текущая ветка
+
+echo -e "${BLUE}============================== Пушим изменения в пакет yabs-banana-www ==============================${NORMAL}"
+
+# Проверяем есть ли новые коммиты
+commits=`git log @{u}..`
+if [ -z "$commits" ]; then
+	echo -e "${RED}=== Вы ничего не закоммитили ===${NORMAL}"
+	exit 0
+fi
+
+# Если ветка релизная - делаем дела
+if [[ $CURRENT_BRANCH = $PROTECTED_BRANCH ]]; then
+	# Узнаем номер тикета
+	read -p "=== Введите номер тикета. Например: YABS-6868 или BSDEV-4254: " < /dev/tty
+	TICKET=$REPLY
+
+	# Узнаем номер тикета
+	read -p "=== Вкратце опишите фичу, которую добавляете: " < /dev/tty
+	COMMENT=$REPLY
+
+	# Хотфикс или простой коммит?
+	read -p "=== Это хотфикс (хотфиксы дополнительно коммитятся в последний релизный бранч)? [Y/n]: " < /dev/tty
+	HOTFIX=$REPLY
+
+	if [[ $HOTFIX = "y" || $HOTFIX = "Y" ]]; then
+		HOTFIX="1"
+		echo -e "${MAGENTA}=== Это будет ХОТФИКС! Изменения будут синхронизированы не только с транком, но и с релизным бранчем.${NORMAL}"
+		read -p "=== Кстати, какой релиз фиксим? Например: 101 или 057: " < /dev/tty
+		RELEASE=$REPLY
+	fi
+
+	# Подтягиваем dev-зависимости и собираем js/less
+	echo -e "${MAGENTA}=== Возможно вам потребуется ввести SUDO-пароль. А возможно и не придется :)${NORMAL}"
+	cd $DIR/../../pybsadm/ && sudo npm install && grunt build;
+	if [ $? -ne 0 ]; then 
+		echo -e "${RED}=== Грусть-печаль. Что-то зафейлилось при 'cd $DIR/../../pybsadm/ && sudo npm install && grunt build;'${NORMAL}"
+		exit 1
+	fi
+	echo -e "${GREEN}=== Мы успешно собрали код${NORMAL}"
+
+	# Синхронизируемся с SVN-транком
+	mkdir -p $DIR/../../hooks/svn
+	if [ -d "$DIR/../../hooks/svn/yabs-banana-www" ]; then
+		cd $DIR/../../hooks/svn/yabs-banana-www && svn up --non-interactive --trust-server-cert > $LOG_FILE
+		if [ $? -ne 0 ]; then 
+			echo -e "${RED}=== Грусть-печаль. Что-то зафейлилось при 'cd $DIR/../../hooks/svn/ && svn up --non-interactive --trust-server-cert'${NORMAL}"
+			exit 1
+		fi
+	else
+		cd $DIR/../../hooks/svn/ && svn co --non-interactive --trust-server-cert https://svn.yandex.ru/yabs/trunk/interface/yabs-banana-www > $LOG_FILE
+		if [ $? -ne 0 ]; then 
+			echo -e "${RED}=== Грусть-печаль. Что-то зафейлилось при 'cd $DIR/../../hooks/svn/ && svn co  --non-interactive --trust-server-cert https://svn.yandex.ru/yabs/trunk/interface/yabs-banana-www'${NORMAL}"
+			exit 1
+		fi
+	fi
+	echo -e "${GREEN}=== Мы успешно выкачали/обновили код из SVN${NORMAL}"
+
+	# Синхронизируемся с SVN-релизом, если ХОТФИКС
+	if [[ $HOTFIX = "1" ]]; then
+		if [ -d "$DIR/../../hooks/svn/r$RELEASE" ]; then
+			cd $DIR/../../hooks/svn/r$RELEASE && svn up --non-interactive --trust-server-cert >> $LOG_FILE
+			if [ $? -ne 0 ]; then 
+				echo -e "${RED}=== Грусть-печаль. Что-то зафейлилось при 'cd $DIR/../../hooks/svn/r$RELEASE && svn up --non-interactive --trust-server-cert'${NORMAL}"
+				exit 1
+			fi
+		else
+			cd $DIR/../../hooks/svn/ && svn co --non-interactive --trust-server-cert https://svn.yandex.ru/yabs/branches/yabs-banana-www/r$RELEASE >> $LOG_FILE
+			if [ $? -ne 0 ]; then 
+				echo -e "${RED}=== Грусть-печаль. Что-то зафейлилось при 'cd $DIR/../../hooks/svn/r$RELEASE && svn co --non-interactive --trust-server-cert https://svn.yandex.ru/yabs/branches/yabs-banana-www/r$RELEASE'${NORMAL}"
+				exit 1
+			fi
+		fi
+		echo -e "${GREEN}=== Мы успешно выкачали/обновили код из релизного бранча SVN${NORMAL}"
+	fi
+
+	# RSYNC с SVN-транком
+	rsync --progress -av --exclude='.svn*' --exclude='/hooks/svn/*' --exclude='/pybsadm/node_modules' --exclude='*.log' $DIR/../../* $DIR/../../hooks/svn/yabs-banana-www >> $LOG_FILE
+	echo -e "${GREEN}=== Мы успешно сделали rsync в SVN-транк${NORMAL}"
+
+	echo -e "${CYAN}=== Внимательно посмотрите вывод svn status${NORMAL}"
+	cd $DIR/../../hooks/svn/yabs-banana-www && svn status | grep '^!' | sed -e 's/^! /svn delete "'/g -e 's/$/"/g' -e 's/      //g' | sh  >> $LOG_FILE && svn status | grep '^?' | sed -e 's/^? /svn add "/g' -e 's/$/"/g' -e 's/      //g' | sh  >> $LOG_FILE && svn status
+	if [ $? -ne 0 ]; then 
+		echo -e "${RED}=== Грусть-печаль. Что-то зафейлилось при svn add / svn delete / svn status"
+		exit 1
+	fi
+
+	# Коммит в SVN-транк
+	read -p "=== Все ок? [Y/n]: " < /dev/tty
+	ALL_OK=$REPLY
+	if [[ $ALL_OK = "y" || $ALL_OK = "Y" ]]; then
+		cd $DIR/../../hooks/svn/yabs-banana-www && svn commit --non-interactive --trust-server-cert -m "$TICKET: $COMMENT"
+		if [ $? -ne 0 ]; then 
+			echo -e "${RED}=== Грусть-печаль. Что-то пошло не так во время svn commit -m '$TICKET: $COMMENT'. Возможно, тикет не открыт или вы не являетесь исполнителем.${NORMAL}"
+			exit 1
+		fi
+	else
+		echo -e "${RED}=== Пуш отменен!${NORMAL}"
+		rm -r $DIR/../../hooks/svn/yabs-banana-www
+		exit 1;
+	fi
+	echo -e "${GREEN}=== SVN-транк синхронизирован!${NORMAL}"
+
+	# Коммит в SVN-бранч
+	if [[ $HOTFIX = "1" ]]; then
+		# RSYNC с SVN-бранчем
+		rsync --progress -av --exclude='.svn*' --exclude='/hooks/svn/*' --exclude='/pybsadm/node_modules' --exclude='*.log' $DIR/../../* $DIR/../../hooks/svn/r$RELEASE >> $LOG_FILE
+		echo -e "${GREEN}=== Мы успешно сделали rsync в SVN-бранч${NORMAL}"
+
+		echo -e "${CYAN}=== Внимательно посмотрите вывод svn status${NORMAL}"
+		cd $DIR/../../hooks/svn/r$RELEASE && svn status | grep '^!' | sed -e 's/^! /svn delete "'/g -e 's/$/"/g' -e 's/      //g' | sh  >> $LOG_FILE && svn status | grep '^?' | sed -e 's/^? /svn add "/g' -e 's/$/"/g' -e 's/      //g' | sh  >> $LOG_FILE && svn status
+		if [ $? -ne 0 ]; then 
+			echo -e "${RED}=== Грусть-печаль. Что-то зафейлилось при svn add / svn delete / svn status"
+			exit 1
+		fi
+
+		# Коммит в SVN-бранч
+		read -p "=== Все ок? [Y/n]: " < /dev/tty
+		ALL_OK=$REPLY
+		if [[ $ALL_OK = "y" || $ALL_OK = "Y" ]]; then
+			cd $DIR/../../hooks/svn/r$RELEASE && svn commit --non-interactive --trust-server-cert -m "$TICKET: $COMMENT"
+			if [ $? -ne 0 ]; then 
+				echo -e "${RED}=== Грусть-печаль. Что-то пошло не так во время svn commit -m '$TICKET: $COMMENT'. Возможно, тикет не открыт или вы не являетесь исполнителем.${NORMAL}"
+				exit 1
+			fi
+		else
+			echo -e "${RED}=== Пуш отменен!${NORMAL}"
+			rm -r $DIR/../../hooks/svn/r$RELEASE
+			exit 1;
+		fi
+		echo -e "${GREEN}=== SVN-бранч синхронизирован!${NORMAL}"
+	fi
+
+	echo -e "${GREEN}=== Пуш успешно выполнен!${NORMAL}"
+	exit 0
+fi
+
+# Если ветка не релизная - можно пушить что угодно
+echo -e "${GREEN}=== Пуш успешно выполнен. SVN не синхронизирован! Не щабудьте смержить фичу в master. ${NORMAL}"
+exit 0 
